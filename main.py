@@ -1,12 +1,16 @@
 import asyncio
 import time
+import json
+import httpx
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from time import process_time
 
-from fastapi import BackgroundTasks, FastAPI, Request, HTTPException, Depends
+from fastapi import BackgroundTasks, FastAPI, Request, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlmodel import SQLModel, Field
 
-from sqlalchemy import Column, Integer, String, Boolean
+from sqlalchemy import Column, Integer, String, Boolean, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -14,26 +18,73 @@ Base = declarative_base()
 engine = create_async_engine(
     "sqlite+aiosqlite:///./tasks.db",
 )
-class TaskModel(Base):
+nc = None
+task_loader_task: asyncio.Task | None = None
+
+class TaskModel(SQLModel, table=True):
     __tablename__ = "tasks"
 
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String)
-    description = Column(String)
-    done = Column(Boolean, default=False)
+    id: int | None = Field(primary_key=True)
+    title: str
+    description: str
+    done: bool = False
 
 DBSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, class_=AsyncSession)
+
+class ConnectionManadger:
+    def __init__(self):
+        self.active_connection: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connection.append(websocket)
+
+    async def handle(self, data, websocket):
+        if data == "spec":
+            await websocket.send_text("SPEC OK!")
+        elif data == "close":
+            await self.disconnect(websocket)
+        else:
+            await websocket.send_text(data * 10)
+
+    async def disconnect(self, websocket: WebSocket):
+        await websocket.close()
+        self.active_connection.remove(websocket)
+
+    async def broadcast(self, data: str):
+        for ws in self.active_connection:
+            await ws.send_text(data)
+
+manager = ConnectionManadger()
 
 async def get_db():
     db = DBSession()
     try:
         yield db
     finally:
-        db.close()
+        await db.close()
 app = FastAPI(
     title="TODO API",
     version="1.0"
 )
+
+@app.on_event("startup")
+async def on_startup():
+    global nc
+    import nats
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    nc = await nats.connect("nats://127.0.0.1:4222")
+
+    async def message_handler(msg):
+        data = msg.data.decode()
+        print (f"NATS msg: {data}")
+        await manager.broadcast(data)
+
+    await nc.subscribe("tasks.new", cb=message_handler)
+
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,11 +102,11 @@ async def middleware(request: Request, call_next):
     print(f"Request to {request.url.path} processed in {process_time:.4f} seconds")
     return response
 
-class TaskCreate(BaseModel):
+class TaskCreate(SQLModel):
     title: str
     description: str
 
-class TaskUpdate(TaskCreate):
+class TaskUpdate(SQLModel):
     title: str
     description: str
     done: bool = False
@@ -67,20 +118,22 @@ tasks: list[Task] = []
 next_id = 1
 
 # Параметры a и b сразу типизируем как int
-@app.get("/add")
-def add_numbers(a: int, b: int):
-    return {"result": a + b}
+# @app.get("/add")
+# def add_numbers(a: int, b: int):
+#     return {"result": a + b}
 
-@app.get("/tasks", response_model=list[Task])
+@app.get("/tasks", response_model=list[TaskModel])
 async def get_tasks(db: DBSession = Depends(get_db)):
-    return db.query(TaskModel).all()
+    stmt = select(TaskModel)
+    result = await db.execute(stmt)
+    return result.scalars()
 
-@app.get("/tasks/{task_id}", response_model=Task)
-async def get_task(task_id: int):
-    for t in tasks:
-        if t.id == task_id:
-            return t
-    raise HTTPException(status_code=404, detail="Task not found")
+@app.get("/tasks/{task_id}", response_model=TaskModel)
+async def get_task(task_id: int, db: DBSession = Depends(get_db)):
+    task = await db.get(TaskModel, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    return task
 
 @app.post("/tasks", response_model=Task, status_code=201)
 async def create_task(
@@ -91,68 +144,101 @@ async def create_task(
         description=task.description,
     )
     db.add(new_task)
-    db.commit()
+    await db.commit()
+    await db.refresh(new_task)
+
+    await nc.publish("tasks.new", json.dumps(new_task.dict()).encode())
+
     return new_task
 
+@app.patch("/tasks/{task_id}", response_model=Task)
+async def patch_task(task_id: int, patch: TaskUpdate, db: AsyncSession = Depends(get_db)):
+    task = await db.get(TaskModel, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
 
-    global next_id
-    new_task = Task(
-        id=next_id,
-        title=task.title,
-        description=task.description
-    )
-    tasks.append(new_task)
-    next_id += 1
-    return new_task
+    data = patch.dict(exclude_unset=True)
+    for k, v in data.items():
+        setattr(task, k, v)
+
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+
+    return task
 
 @app.put("/tasks/{task_id}", response_model=Task)
-async def update_task(task_id: int, updated: TaskUpdate):
-    for idx, t in enumerate(tasks):
-        if t.id == task_id:
-            tasks[idx] = Task(
-                id = t.id,
-                title = updated.title,
-                description = updated.description,
-                done = updated.done,
-            )
-            return tasks[idx]
-    raise HTTPException(status_code=404, detail="Task not found")
+async def update_task(task_id: int, updated: TaskUpdate, db: DBSession = Depends(get_db)):
+    task = await db.get(TaskModel, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    update_data = updated.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(task, key, value)
+
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+
+    return task
+
+
 
 @app.delete("/tasks/{task_id}", status_code=204)
-async def delete_task(task_id: int):
-    for t in tasks:
-        if t.id == task_id:
-            tasks.remove(t)
-            return
-    raise HTTPException(status_code=404, detail="Task not found")
+async def delete_task(task_id: int,
+    db: DBSession = Depends(get_db)):
+    obj = await db.get(TaskModel, task_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="Task not found")
+    await db.delete(obj)
+    await db.commit()
 
-@app.get("/async_task")
-async def async_task():
-    await asyncio.sleep(60)
-    return {"message": "ok"}
+# @app.get("/async_task")
+# async def async_task():
+#     await asyncio.sleep(60)
+#     return {"message": "ok"}
+#
+# @app.get("/background_task")
+# async def background_tasks(background_task: BackgroundTasks):
+#     def slow_time():
+#         import time
+#         time.sleep(60)
+#
+#     background_task.add_task(slow_time)
+#     return {"message": "task started"}
 
-@app.get("/background_task")
-async def background_tasks(background_task: BackgroundTasks):
-    def slow_time():
-        import time
-        time.sleep(60)
-
-    background_task.add_task(slow_time)
-    return {"message": "task started"}
+async def generate_fake_task(db: DBSession):
+    task = TaskModel(
+        title="Generated task",
+        description="This task was created by background generator",
+        done=False
+    )
+    db.add(task)
+    await db.commit()
 
 executor = ThreadPoolExecutor(max_workers=2)
 executor = ProcessPoolExecutor(max_workers=2)
 
-def blocking_io_task():
-    import time
-    time.sleep(60)
-    return "ok"
+# def blocking_io_task():
+#     import time
+#     time.sleep(60)
+#     return "ok"
+#
+@app.post("/task-generator/run", status_code=202)
+async def run_generator():
+    global task_loader_task
 
-@app.get("/thread_pool_sleep")
-async def thread_pool_sleep():
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(executor, blocking_io_task)
-    return {"message": result}
+    if task_loader_task and not task_loader_task.done():
+        return {"message": "Background task already running"}
+    task_loader_task = asyncio.create_task(periodic_task_loader())
+    return {"message": "Background task started"}
+
+# @app.get("/thread_pool_sleep")
+# async def thread_pool_sleep():
+#     loop = asyncio.get_running_loop()
+#     result = await loop.run_in_executor(executor, blocking_io_task)
+#     return {"message": result}
 
 def heavy_func(n: int = 10_000_000_000):
     result = 0
@@ -160,10 +246,116 @@ def heavy_func(n: int = 10_000_000_000):
         result += i * i
     return result
 
-@app.get("/cpu_task")
-async def cpu_task(n: int = 10_000_000_000):
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(executor, heavy_func)
-    return{
-        "message": result
+# @app.get("/cpu_task")
+# async def cpu_task(n: int = 10_000_000_000):
+#     loop = asyncio.get_running_loop()
+#     result = await loop.run_in_executor(executor, heavy_func)
+#     return{
+#         "message": result
+#     }
+
+from playwright.async_api import async_playwright
+
+class Product(BaseModel):
+    name: str
+    price: str
+    link: str
+
+class CitilinkParser:
+
+    BASE_URL = "https://www.citilink.ru"
+    async def start(self):
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(headless=True)
+        context = await self.browser.new_context()
+        self.page = await context.new_page()
+
+    async def load_page(self, url):
+        await self.page.goto(url)
+        await self.page.wait_for_selector(
+            '[data-meta-name="SnippetProductVerticalLayout"]',
+            timeout=30_000
+        )
+
+    async def parce_products(self) -> list[Product]:
+        products = []
+        cards = await self.page.query_selector_all(
+            '[data-meta-name="SnippetProductVerticalLayout"]',
+        )
+        print(f"Найдено товаров: {len(cards)}")
+
+        for card in cards:
+            name_el = await card.query_selector('[data-meta-name="Snippet__title"]')
+            if not name_el: continue
+            name = await name_el.inner_text()
+
+            link_el = await card.query_selector('a[href*="/product/"]')
+            href = await link_el.get_attribute('href') if link_el else None
+            link = self.BASE_URL + href
+
+            price_el = await card.query_selector('[data-meta-name="Snippet__price"]')
+            price = await price_el.inner_text() if price_el else "Не указана"
+
+            products.append(Product(name=name, price=price, link=link))
+
+        return products
+
+async def periodic_task_loader():
+    while True:
+        async with httpx.AsyncClient() as client:
+            r = await client.get("https://jsonplaceholder.typicode.com/todos/1")
+            data = r.json()
+
+            async with DBSession() as db:
+                task = TaskModel(
+                    title=data["title"],
+                    description="Loaded from API",
+                    done=data["completed"]
+                )
+                db.add(task)
+                await db.commit()
+                await db.refresh(task)
+
+                await nc.publish(
+                    "tasks.new",
+                    json.dumps(task.dict()).encode()
+                )
+
+        await asyncio.sleep(30)
+
+# @app.post("/task-generator/test/run", status_code=202)
+# async def run_generator():
+#     asyncio.create_task(periodic_task_loader())
+#     return {"message": "Task loader started"}
+
+@app.get("/parser")
+async def parser(background_task: BackgroundTasks):
+    citi_parser = CitilinkParser()
+    async def func(x):
+        await citi_parser.start()
+        await citi_parser.load_page(x)
+        products = await citi_parser.parce_products()
+        print(products)
+
+    async def paginator(url, max_pages):
+        for page in range(max_pages):
+            new_url = url + f"?p={page+1}"
+            await func(new_url)
+
+    category_url = "https://www.citilink.ru/catalog/smartfony/"
+    background_task.add_task(paginator, category_url, max_pages=5)
+    return {
+        "message": "Парсер запущен в фоне"
     }
+
+
+@app.websocket("/ws/tasks")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await manager.handle(data, websocket)
+    except WebSocketDisconnect:
+        await manager.disconnect(websocket)
